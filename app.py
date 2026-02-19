@@ -153,12 +153,39 @@ def admin_dashboard():
 # 4. MAIN NAVIGATION
 # ==========================================
 def main():
-    st.sidebar.title("KITS Exam Cloud ERP")
-    role = st.sidebar.selectbox("Access Role", ["Faculty", "Deputy COE", "Admin Dashboard"])
-   
-    if role == "Faculty": faculty_interface()
-    elif role == "Deputy COE": coe_interface()
-    elif role == "Admin Dashboard": admin_dashboard()
+    st.sidebar.title("🔐 KITS ERP Access Control")
+    
+    # 1. Select Role
+    role = st.sidebar.selectbox("Access Role", 
+                                ["Faculty Portal", "Deputy COE Portal", "Admin Dashboard"])
+    
+    # 2. Password Gatekeeper
+    password_input = st.sidebar.text_input(f"Enter Password for {role}", type="password")
+    
+    # 3. Access Logic
+    if role == "Admin Dashboard":
+        if password_input == st.secrets["passwords"]["admin"]:
+            admin_dashboard()
+        elif password_input == "":
+            st.info("Please enter the Admin password in the sidebar.")
+        else:
+            st.error("🚫 Access Denied: Incorrect Admin Password")
+
+    elif role == "Deputy COE Portal":
+        if password_input == st.secrets["passwords"]["coe"]:
+            coe_interface()
+        elif password_input == "":
+            st.info("Please enter the Deputy COE password.")
+        else:
+            st.error("🚫 Access Denied: Incorrect COE Password")
+
+    elif role == "Faculty Portal":
+        if password_input == st.secrets["passwords"]["faculty"]:
+            faculty_interface()
+        elif password_input == "":
+            st.info("Please enter the Faculty password.")
+        else:
+            st.error("🚫 Access Denied: Incorrect Faculty Password")
 
 if __name__ == "__main__":
     main()
