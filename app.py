@@ -1,0 +1,93 @@
+import streamlit as st
+import pandas as pd
+from sqlalchemy import text
+
+# Initialize Connection
+conn = st.connection("postgresql", type="sql")
+
+# ==========================================
+# 1. COMPONENT VALIDATION LOGIC
+# ==========================================
+def check_marks_limit(df, mark_col, max_val):
+    invalid = df[df[mark_col] > max_val]
+    return invalid
+
+# ==========================================
+# 2. FACULTY INTERFACE (CIE/ISE/Practical)
+# ==========================================
+def faculty_interface():
+    st.header("👨‍🏫 Faculty Entry Portal")
+    
+    # Query assigned subjects (simulated filter)
+    subjects_df = conn.query("SELECT * FROM subjects", ttl="1h")
+    selected_sub = st.selectbox("Select Subject", subjects_df['code'].tolist())
+    sub_info = subjects_df[subjects_df['code'] == selected_sub].iloc[0]
+
+    if sub_info['course_type'] == 'Theory':
+        # Faculty handles CIE and ISE
+        c1, c2 = st.columns(2)
+        f_cie = c1.file_uploader("Upload CIE CSV (ID, Marks, Attendance)", type=['csv'])
+        f_ise = c2.file_uploader("Upload ISE CSV (ID, Marks)", type=['csv'])
+        
+        if f_cie:
+            df = pd.read_csv(f_cie)
+            # Validation logic
+            invalid = check_marks_limit(df, 'marks', sub_info['cie_max'])
+            if not invalid.empty:
+                st.error(f"Error: Some CIE marks exceed {sub_info['cie_max']}")
+            else:
+                if st.button("Sync CIE to Cloud"):
+                    with conn.session as s:
+                        for _, row in df.iterrows():
+                            s.execute(text("""
+                                INSERT INTO marks_master (student_id, subject_code, cie_marks, attendance)
+                                VALUES (:id, :code, :m, :att)
+                                ON CONFLICT (student_id, subject_code) 
+                                DO UPDATE SET cie_marks = :m, attendance = :att
+                            """), params={"id": row['id'], "code": selected_sub, "m": row['marks'], "att": row['attendance']})
+                        s.commit()
+                    st.success("CIE Marks Synchronized.")
+
+    else: # Practical logic
+        st.info("Upload ISE and ESE for Practical Components")
+        # Similar implementation for Practical CSVs...
+
+# ==========================================
+# 3. DEPUTY COE INTERFACE (Theory ESE)
+# ==========================================
+def coe_interface():
+    st.header("🏛️ Deputy COE: Theory ESE Entry")
+    # Query Theory subjects only
+    theory_subs = conn.query("SELECT * FROM subjects WHERE course_type='Theory'", ttl="1h")
+    target_sub = st.selectbox("Select Subject for ESE", theory_subs['code'].tolist())
+    sub_info = theory_subs[theory_subs['code'] == target_sub].iloc[0]
+
+    f_ese = st.file_uploader("Upload ESE Master CSV", type=['csv'])
+    if f_ese:
+        df = pd.read_csv(f_ese)
+        # Handle 'AB' as string, validate numeric values
+        if st.button("Finalize ESE Upload"):
+            with conn.session as s:
+                for _, row in df.iterrows():
+                    s.execute(text("""
+                        UPDATE marks_master 
+                        SET ese_marks = :m 
+                        WHERE student_id = :id AND subject_code = :code
+                    """), params={"id": row['id'], "code": target_sub, "m": str(row['marks'])})
+                s.commit()
+            st.success("Theory ESE marks finalized in cloud.")
+
+# ==========================================
+# 4. MAIN NAVIGATION
+# ==========================================
+def main():
+    st.sidebar.title("KITS Exam Cloud ERP")
+    role = st.sidebar.selectbox("Access Role", ["Faculty", "Deputy COE", "Admin Dashboard"])
+    
+    if role == "Faculty": faculty_interface()
+    elif role == "Deputy COE": coe_interface()
+    # Admin interface for final SGPA processing...
+
+if __name__ == "__main__":
+    main()
+      
