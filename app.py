@@ -52,6 +52,7 @@ def faculty_interface():
         st.info("Upload ISE and ESE for Practical Components")
         # Similar implementation for Practical CSVs...
 
+
 # ==========================================
 # 3. DEPUTY COE INTERFACE (Theory ESE)
 # ==========================================
@@ -76,6 +77,77 @@ def coe_interface():
                     """), params={"id": row['id'], "code": target_sub, "m": str(row['marks'])})
                 s.commit()
             st.success("Theory ESE marks finalized in cloud.")
+
+
+
+import streamlit as st
+import pandas as pd
+from sqlalchemy import text
+
+# Assuming 'conn' is already initialized as:
+# conn = st.connection("postgresql", type="sql")
+
+def admin_dashboard():
+    st.header("🛡️ Examination Controller Dashboard")
+    
+    # 1. Fetch Master Data
+    subjects = conn.query("SELECT * FROM subjects", ttl="0")
+    marks = conn.query("SELECT * FROM marks_master", ttl="0")
+    
+    if marks.empty:
+        st.warning("No marks have been uploaded yet by Faculty or Deputy COE.")
+        return
+
+    # 2. Check for Missing Components
+    st.subheader("📊 Data Completion Status")
+    
+    # We want to find if any CIE, ISE, or ESE is '0' or NULL
+    # This logic identifies incomplete rows
+    incomplete_cie = marks[marks['cie_marks'] == 0]
+    incomplete_ise = marks[marks['ise_marks'] == 0]
+    incomplete_ese = marks[marks['ese_marks'].astype(str) == '0']
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Missing CIE", len(incomplete_cie))
+    col2.metric("Missing ISE", len(incomplete_ise))
+    col3.metric("Missing ESE", len(incomplete_ese))
+
+    # 3. Validation: Marks vs Max Marks
+    st.subheader("🚫 Validation Errors (Marks > Max)")
+    
+    # Merge marks with subject rules to compare
+    merged = pd.merge(marks, subjects, left_on='subject_code', right_on='code')
+    
+    # Check for violations
+    error_cie = merged[merged['cie_marks'] > merged['cie_max']]
+    error_ise = merged[merged['ise_marks'] > merged['ise_max']]
+    # ESE check (handles numeric conversion for 'AB')
+    merged['ese_numeric'] = pd.to_numeric(merged['ese_marks'], errors='coerce').fillna(0)
+    error_ese = merged[merged['ese_numeric'] > merged['ese_max']]
+
+    if not error_cie.empty or not error_ise.empty or not error_ese.empty:
+        st.error("Action Required: Some entries exceed the maximum allowed marks!")
+        st.write(pd.concat([error_cie, error_ise, error_ese]))
+    else:
+        st.success("All uploaded marks are within valid limits.")
+
+    # 4. Final Processing Trigger
+    st.divider()
+    st.subheader("🏁 Finalize Semester Results")
+    
+    ready_to_process = (len(incomplete_cie) == 0 and 
+                        len(incomplete_ise) == 0 and 
+                        len(incomplete_ese) == 0 and
+                        len(error_cie) == 0)
+
+    if ready_to_process:
+        if st.button("Calculate SGPA & Generate Master Sheet", type="primary"):
+            # Run your Protocol A / Protocol B logic here
+            st.balloons()
+            st.success("Final Result Sheet Generated!")
+    else:
+        st.button("Calculate SGPA", disabled=True, help="Complete all marks entry to enable.")
+        st.info("The 'Calculate SGPA' button is disabled until all faculty and COE entries are 100% complete.")
 
 # ==========================================
 # 4. MAIN NAVIGATION
