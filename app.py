@@ -1,192 +1,232 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from sqlalchemy import text
 
-# Initialize Connection
+# ==========================================
+# 1. INITIALIZATION & HELPERS
+# ==========================================
 conn = st.connection("postgresql", type="sql")
 
-# ==========================================
-# 1. COMPONENT VALIDATION LOGIC
-# ==========================================
 def check_marks_limit(df, mark_col, max_val):
-    invalid = df[df[mark_col] > max_val]
-    return invalid
+    """Returns rows where marks exceed the allowed maximum."""
+    return df[df[mark_col] > max_val]
+
+def sync_to_supabase(df, sub_code, component, has_attendance=False, is_ese=False):
+    """Handles the heavy lifting of updating the cloud database."""
+    with conn.session as s:
+        for _, row in df.iterrows():
+            # Handle ESE as string (for 'AB'), others as numeric
+            val = str(row['marks']) if is_ese else float(row['marks'])
+            att = float(row['attendance']) if has_attendance else 0
+            
+            query = text(f"""
+                INSERT INTO marks_master (student_id, subject_code, {component}, attendance)
+                VALUES (:id, :code, :val, :att)
+                ON CONFLICT (student_id, subject_code) 
+                DO UPDATE SET {component} = :val {" , attendance = :att" if has_attendance else ""}
+            """)
+            s.execute(query, params={"id": str(row['id']), "code": sub_code, "val": val, "att": att})
+        s.commit()
+    st.success(f"Successfully synchronized {len(df)} records for {component}!")
 
 # ==========================================
-# 2. FACULTY INTERFACE (CIE/ISE/Practical)
+# 2. THE GRADING ENGINE (Logic Layer)
+# ==========================================
+class kits_grading_engine:
+    @staticmethod
+    def calculate_relative_thresholds(marks, total_max, p_threshold):
+        """Calculates D-grade boundary based on statistics."""
+        if len(marks) < 30: # Absolute Grading for small batches
+            return 0.40 * total_max
+        
+        avg = np.mean(marks)
+        std = np.std(marks)
+        relative_d = avg - 1.5 * std
+        
+        # Clamp between 30% and P-threshold
+        return max(0.30 * total_max, min(relative_d, p_threshold))
+
+    @staticmethod
+    def assign_grade(mark, threshold, total_max):
+        """Standard relative grading distribution."""
+        if mark < threshold: return 'F'
+        # Simple linear distribution for A+ to C
+        # In your final version, you can insert the full Mean/Sigma table here
+        if mark >= 0.9 * total_max: return 'A+'
+        if mark >= 0.8 * total_max: return 'A'
+        if mark >= threshold: return 'D'
+        return 'F'
+
+# ==========================================
+# 3. INTERFACE: FACULTY PORTAL
 # ==========================================
 def faculty_interface():
-    st.header("👨‍🏫 Faculty Entry Portal")
+    st.header("👨‍🏫 Faculty Mark Entry Portal")
     
-    # Query assigned subjects (simulated filter)
     subjects_df = conn.query("SELECT * FROM subjects", ttl="1h")
-    selected_sub = st.selectbox("Select Subject", subjects_df['code'].tolist())
-    sub_info = subjects_df[subjects_df['code'] == selected_sub].iloc[0]
+    selected_code = st.selectbox("Select Subject", subjects_df['code'].tolist())
+    sub_info = subjects_df[subjects_df['code'] == selected_code].iloc[0]
 
-    if sub_info['course_type'] == 'Theory':
-        # Faculty handles CIE and ISE
-        c1, c2 = st.columns(2)
-        f_cie = c1.file_uploader("Upload CIE CSV (ID, Marks, Attendance)", type=['csv'])
-        f_ise = c2.file_uploader("Upload ISE CSV (ID, Marks)", type=['csv'])
+    st.info(f"Subject: {sub_info['name']} | Type: {sub_info['course_type']}")
+
+    # Split logic for Theory vs Practical
+    is_theory = sub_info['course_type'] == 'Theory'
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        comp1 = "CIE" if is_theory else "Practical ISE"
+        max1 = sub_info['cie_max'] if is_theory else sub_info['ise_max']
+        db_col1 = "cie_marks" if is_theory else "ise_marks"
         
-        if f_cie:
-            df = pd.read_csv(f_cie)
-            # Validation logic
-            invalid = check_marks_limit(df, 'marks', sub_info['cie_max'])
-            if not invalid.empty:
-                st.error(f"Error: Some CIE marks exceed {sub_info['cie_max']}")
-            else:
-                if st.button("Sync CIE to Cloud"):
-                    with conn.session as s:
-                        for _, row in df.iterrows():
-                            s.execute(text("""
-                                INSERT INTO marks_master (student_id, subject_code, cie_marks, attendance)
-                                VALUES (:id, :code, :m, :att)
-                                ON CONFLICT (student_id, subject_code) 
-                                DO UPDATE SET cie_marks = :m, attendance = :att
-                            """), params={"id": row['id'], "code": selected_sub, "m": row['marks'], "att": row['attendance']})
-                        s.commit()
-                    st.success("CIE Marks Synchronized.")
+        f1 = st.file_uploader(f"Upload {comp1} (Max: {max1})", type=['csv'], key="f1")
+        if f1:
+            df = pd.read_csv(f1)
+            df.columns = df.columns.str.strip().lower()
+            if not check_marks_limit(df, 'marks', max1).empty:
+                st.error("Validation Error: Marks exceed maximum!")
+            elif st.button(f"Sync {comp1}"):
+                sync_to_supabase(df, selected_code, db_col1, has_attendance=True)
 
-    else: # Practical logic
-        st.info("Upload ISE and ESE for Practical Components")
-        # Similar implementation for Practical CSVs...
-
+    with col2:
+        comp2 = "ISE" if is_theory else "Practical ESE"
+        max2 = sub_info['ise_max'] if is_theory else sub_info['ese_max']
+        db_col2 = "ise_marks" if is_theory else "ese_marks"
+        
+        f2 = st.file_uploader(f"Upload {comp2} (Max: {max2})", type=['csv'], key="f2")
+        if f2:
+            df = pd.read_csv(f2)
+            df.columns = df.columns.str.strip().lower()
+            if not check_marks_limit(df, 'marks', max2).empty:
+                st.error("Validation Error: Marks exceed maximum!")
+            elif st.button(f"Sync {comp2}"):
+                sync_to_supabase(df, selected_code, db_col2, is_ese=(not is_theory))
 
 # ==========================================
-# 3. DEPUTY COE INTERFACE (Theory ESE)
+# 4. INTERFACE: DEPUTY COE (Theory ESE)
 # ==========================================
 def coe_interface():
     st.header("🏛️ Deputy COE: Theory ESE Entry")
-    # Query Theory subjects only
-    theory_subs = conn.query("SELECT * FROM subjects WHERE course_type='Theory'", ttl="1h")
-    target_sub = st.selectbox("Select Subject for ESE", theory_subs['code'].tolist())
+    theory_subs = conn.query("SELECT * FROM subjects WHERE course_type='Theory'", ttl="0")
+    target_sub = st.selectbox("Select Subject", theory_subs['code'].tolist())
     sub_info = theory_subs[theory_subs['code'] == target_sub].iloc[0]
 
-    f_ese = st.file_uploader("Upload ESE Master CSV", type=['csv'])
+    f_ese = st.file_uploader("Upload ESE CSV (id, marks)", type=['csv'])
     if f_ese:
         df = pd.read_csv(f_ese)
-        # Handle 'AB' as string, validate numeric values
+        df.columns = df.columns.str.strip().lower()
         if st.button("Finalize ESE Upload"):
-            with conn.session as s:
-                for _, row in df.iterrows():
-                    s.execute(text("""
-                        UPDATE marks_master 
-                        SET ese_marks = :m 
-                        WHERE student_id = :id AND subject_code = :code
-                    """), params={"id": row['id'], "code": target_sub, "m": str(row['marks'])})
-                s.commit()
-            st.success("Theory ESE marks finalized in cloud.")
+            sync_to_supabase(df, target_sub, 'ese_marks', is_ese=True)
 
-
-
-import streamlit as st
-import pandas as pd
-from sqlalchemy import text
-
-# Assuming 'conn' is already initialized as:
-# conn = st.connection("postgresql", type="sql")
-
+# ==========================================
+# 5. INTERFACE: ADMIN DASHBOARD
+# ==========================================
 def admin_dashboard():
     st.header("🛡️ Examination Controller Dashboard")
-    
-    # 1. Fetch Master Data
     subjects = conn.query("SELECT * FROM subjects", ttl="0")
     marks = conn.query("SELECT * FROM marks_master", ttl="0")
     
     if marks.empty:
-        st.warning("No marks have been uploaded yet by Faculty or Deputy COE.")
+        st.warning("Awaiting data uploads...")
         return
 
-    # 2. Check for Missing Components
-    st.subheader("📊 Data Completion Status")
-    
-    # We want to find if any CIE, ISE, or ESE is '0' or NULL
-    # This logic identifies incomplete rows
-    incomplete_cie = marks[marks['cie_marks'] == 0]
-    incomplete_ise = marks[marks['ise_marks'] == 0]
+    # Data Status Metrics
     incomplete_ese = marks[marks['ese_marks'].astype(str) == '0']
+    st.metric("Pending ESE Entries", len(incomplete_ese))
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Missing CIE", len(incomplete_cie))
-    col2.metric("Missing ISE", len(incomplete_ise))
-    col3.metric("Missing ESE", len(incomplete_ese))
+   # Inside admin_dashboard() function, under "Final Processing Trigger":
+    if st.button("Calculate SGPA & Generate Master Sheet", type="primary"):
+        st.write("### ⚙️ Processing Final Tabulation...")
+        
+        # 1. Prepare Data
+        df = pd.merge(marks, subjects, left_on='subject_code', right_on='code')
+        df['ese_numeric'] = pd.to_numeric(df['ese_marks'], errors='coerce').fillna(0)
+        df['total_marks'] = df['cie_marks'] + df['ise_marks'] + df['ese_numeric']
+        
+        # 2. Set Hurdles and Boundaries
+        # Hurdle: ESE must be >= 20% of Max ESE
+        df['ese_hurdle_passed'] = df['ese_numeric'] >= (0.2 * df['ese_max'])
+        
+        # Boundary: For this logic, we use 40% as the D-grade boundary
+        # (You can replace '40' with your kits_grading_engine.calculate_relative_thresholds)
+        df['passing_boundary'] = 0.40 * df['total_max']
 
-    # 3. Validation: Marks vs Max Marks
-    st.subheader("🚫 Validation Errors (Marks > Max)")
-    
-    # Merge marks with subject rules to compare
-    merged = pd.merge(marks, subjects, left_on='subject_code', right_on='code')
-    
-    # Check for violations
-    error_cie = merged[merged['cie_marks'] > merged['cie_max']]
-    error_ise = merged[merged['ise_marks'] > merged['ise_max']]
-    # ESE check (handles numeric conversion for 'AB')
-    merged['ese_numeric'] = pd.to_numeric(merged['ese_marks'], errors='coerce').fillna(0)
-    error_ese = merged[merged['ese_numeric'] > merged['ese_max']]
+        # 3. Identify Grace Eligibility (Per Student)
+        # Requirement: Student must have cleared the ESE hurdle in ALL subjects
+        ese_status = df.groupby('student_id')['ese_hurdle_passed'].all().reset_index()
+        ese_status.columns = ['student_id', 'eligible_for_grace']
+        df = pd.merge(df, ese_status, on='student_id')
 
-    if not error_cie.empty or not error_ise.empty or not error_ese.empty:
-        st.error("Action Required: Some entries exceed the maximum allowed marks!")
-        st.write(pd.concat([error_cie, error_ise, error_ese]))
-    else:
-        st.success("All uploaded marks are within valid limits.")
+        # 4. Preliminary Grading & Grace Identification
+        def compute_final_grade(row):
+            # If they failed the ESE Hurdle, it's an automatic F
+            if not row['ese_hurdle_passed']:
+                return 'F'
+            
+            # If they naturally passed
+            if row['total_marks'] >= row['passing_boundary']:
+                # (Insert full A+ to D logic here)
+                return 'D' 
+            
+            # Grace Candidate: 
+            # Needs <= 3 marks AND is eligible (passed all ESE hurdles)
+            gap = row['passing_boundary'] - row['total_marks']
+            if row['eligible_for_grace'] and gap <= 3:
+                return 'Grace_Candidate'
+            
+            return 'F'
 
-    # 4. Final Processing Trigger
-    st.divider()
-    st.subheader("🏁 Finalize Semester Results")
-    
-    ready_to_process = (len(incomplete_cie) == 0 and 
-                        len(incomplete_ise) == 0 and 
-                        len(incomplete_ese) == 0 and
-                        len(error_cie) == 0)
+        df['temp_grade'] = df.apply(compute_final_grade, axis=1)
 
-    if ready_to_process:
-        if st.button("Calculate SGPA & Generate Master Sheet", type="primary"):
-            # Run your Protocol A / Protocol B logic here
-            st.balloons()
-            st.success("Final Result Sheet Generated!")
-    else:
-        st.button("Calculate SGPA", disabled=True, help="Complete all marks entry to enable.")
-        st.info("The 'Calculate SGPA' button is disabled until all faculty and COE entries are 100% complete.")
+        # 5. Apply the "Max 2 Subjects" Rule
+        grace_counts = df[df['temp_grade'] == 'Grace_Candidate'].groupby('student_id').size().reset_index()
+        grace_counts.columns = ['student_id', 'num_grace_needed']
+        df = pd.merge(df, grace_counts, on='student_id', how='left').fillna({'num_grace_needed': 0})
 
+        def finalize_grade(row):
+            if row['temp_grade'] == 'Grace_Candidate':
+                if row['num_grace_needed'] <= 2:
+                    return 'D*' # Award Grace
+                else:
+                    return 'F'  # Too many grace subjects needed
+            return row['temp_grade']
+
+        df['final_grade'] = df.apply(finalize_grade, axis=1)
+
+        # 6. Generate Master View
+        master_sheet = df.pivot(index='student_id', columns='code', values='final_grade')
+        
+        # Highlighting for the Admin
+        def color_grades(val):
+            if val == 'D*': return 'color: blue; font-weight: bold'
+            if val == 'F': return 'color: red'
+            return ''
+
+        st.subheader("📋 Final Tabulation Register (Provisional)")
+        st.dataframe(master_sheet.style.applymap(color_grades), use_container_width=True)
+        
+        st.balloons()
+        st.download_button("📥 Download Official CSV", master_sheet.to_csv(), "KITS_Master_Sheet.csv")
 # ==========================================
-# 4. MAIN NAVIGATION
+# 6. MAIN NAVIGATION
 # ==========================================
 def main():
-    st.sidebar.title("🔐 KITS ERP Access Control")
-    
-    # 1. Select Role
-    role = st.sidebar.selectbox("Access Role", 
-                                ["Faculty Portal", "Deputy COE Portal", "Admin Dashboard"])
-    
-    # 2. Password Gatekeeper
-    password_input = st.sidebar.text_input(f"Enter Password for {role}", type="password")
-    
-    # 3. Access Logic
-    if role == "Admin Dashboard":
-        if password_input == st.secrets["passwords"]["admin"]:
-            admin_dashboard()
-        elif password_input == "":
-            st.info("Please enter the Admin password in the sidebar.")
-        else:
-            st.error("🚫 Access Denied: Incorrect Admin Password")
+    st.sidebar.title("🎓 KITS Exam Cloud ERP")
+    role = st.sidebar.selectbox("Role", ["Faculty Portal", "Deputy COE Portal", "Admin Dashboard"])
+    pwd = st.sidebar.text_input("Password", type="password")
 
-    elif role == "Deputy COE Portal":
-        if password_input == st.secrets["passwords"]["coe"]:
-            coe_interface()
-        elif password_input == "":
-            st.info("Please enter the Deputy COE password.")
-        else:
-            st.error("🚫 Access Denied: Incorrect COE Password")
-
-    elif role == "Faculty Portal":
-        if password_input == st.secrets["passwords"]["faculty"]:
-            faculty_interface()
-        elif password_input == "":
-            st.info("Please enter the Faculty password.")
-        else:
-            st.error("🚫 Access Denied: Incorrect Faculty Password")
+    # Access Logic
+    if pwd == "":
+        st.info("Enter password to proceed.")
+    elif role == "Admin Dashboard" and pwd == st.secrets["passwords"]["admin"]:
+        admin_dashboard()
+    elif role == "Deputy COE Portal" and pwd == st.secrets["passwords"]["coe"]:
+        coe_interface()
+    elif role == "Faculty Portal" and pwd == st.secrets["passwords"]["faculty"]:
+        faculty_interface()
+    else:
+        st.error("Incorrect Password.")
 
 if __name__ == "__main__":
     main()
-      
