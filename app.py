@@ -155,7 +155,7 @@ def admin_dashboard():
 def main():
     st.sidebar.title("KITS Exam Cloud ERP")
     role = st.sidebar.selectbox("Access Role", ["Faculty", "Deputy COE", "Admin Dashboard"])
-    
+    if role == "Admin Dashboard": admin_dashboard()
     if role == "Faculty": faculty_interface()
     elif role == "Deputy COE": coe_interface()
     # Admin interface for final SGPA processing...
